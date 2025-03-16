@@ -20,22 +20,24 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: nightly
-          target: |
-            aarch64-linux-android
-            armv7-linux-androideabi
-            i686-linux-android
-            x86_64-linux-android
           override: true
+
+      - name: Install Rust targets
+        run: |
+          rustup target install aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
 
       - name: Install Just
         run: cargo install just
 
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk
+        run: cargo install cargo-ndk --force
 
       - name: Build project for all targets
         run: |
-          cargo ndk -t armeabi-v7a -t arm64-v8a -t x86 -t x86_64 build --release
+          cargo ndk --target armeabi-v7a build --release
+          cargo ndk --target arm64-v8a build --release
+          cargo ndk --target x86 build --release
+          cargo ndk --target x86_64 build --release
           just package-release
 
       - name: Upload built artifact
