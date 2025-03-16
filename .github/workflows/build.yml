@@ -20,7 +20,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: nightly
-          target: armv7-linux-androideabi
+          target: aarch64-linux-android
           override: true
 
       - name: Install Just
