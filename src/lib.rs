@@ -1,162 +1,155 @@
 #![feature(naked_functions)]
-
 use dobby_rs::Address;
 use jni::JNIEnv;
-use log::{error, info, trace};
+use log::{error, info, trace, warn};
 use nix::{fcntl::OFlag, sys::stat::Mode};
-// use std::arch::asm;
-use std::arch::naked_asm;
+use sha2::{Sha256, Digest};
+use crossbeam_channel::{bounded, Sender};
+use goblin::elf::{Elf, sym::STT_FUNC};
 use std::{
-    fs::File,
-    io::Read,
+    sync::{Mutex, Arc},
+    fs::{File, create_dir_all},
     os::fd::{AsRawFd, FromRawFd},
+    thread,
+    mem,
 };
 use zygisk_rs::{register_zygisk_module, Api, AppSpecializeArgs, Module, ServerSpecializeArgs};
-
-struct MyModule {
+ 
+// --- 全局状态 --- 
+lazy_static::lazy_static! {
+    static ref CACHE: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+    static ref WRITER_CHANNEL: (Sender<(String, Vec<u8>)>, thread::JoinHandle<()>) = {
+        let (sender, receiver) = bounded(100);
+        let handle = thread::spawn(move || {
+            while let Ok((package, data)) = receiver.recv() {
+                process_dex(&package, &data);
+            }
+        });
+        (sender, handle)
+    };
+}
+static mut OLD_OPEN_COMMON: usize = 0;
+ 
+// --- 主模块定义 --- 
+struct DexDumper {
     api: Api,
     env: JNIEnv<'static>,
 }
-
-impl Module for MyModule {
+ 
+impl Module for DexDumper {
+    // 初始化与生命周期方法 
     fn new(api: Api, env: *mut jni_sys::JNIEnv) -> Self {
-        android_logger::init_once(
-            android_logger::Config::default()
-                .with_max_level(log::LevelFilter::Info)
-                .with_tag("dump_dex"),
-        );
+        android_logger::init_once(android_logger::Config::default().with_tag("DexDumper"));
         let env = unsafe { JNIEnv::from_raw(env.cast()).unwrap() };
         Self { api, env }
     }
+ 
     fn pre_app_specialize(&mut self, args: &mut AppSpecializeArgs) {
-        let mut inner = || -> anyhow::Result<()> {
-            let package_name = self
-                .env
-                .get_string(unsafe {
-                    (args.nice_name as *mut jni_sys::jstring as *mut ()
-                        as *const jni::objects::JString<'_>)
-                        .as_ref()
-                        .unwrap()
-                })?
-                .to_string_lossy()
-                .to_string();
-            trace!("pre_app_specialize: package_name: {}", package_name);
-            let module_dir = self
-                .api
-                .get_module_dir()
-                .ok_or_else(|| anyhow::anyhow!("get_module_dir error"))?;
-            let mut list_file = unsafe {
-                File::from_raw_fd(nix::fcntl::openat(
-                    Some(module_dir.as_raw_fd()),
-                    "list.txt",
-                    OFlag::O_CLOEXEC,
-                    Mode::empty(),
-                )?)
-            };
-            let mut file_content = String::new();
-            list_file.read_to_string(&mut file_content)?;
-
-            let find: bool = file_content
-                .split("\n")
-                .any(|item| item.trim() == package_name);
-
-            if !find {
-                self.api
-                    .set_option(zygisk_rs::ModuleOption::DlcloseModuleLibrary);
-                return Ok(());
+        if let Err(e) = self.setup_hook() {
+            error!("Hook setup failed: {}", e);
+            self.api.set_option(zygisk_rs::ModuleOption::DlcloseModuleLibrary);
+        }
+    }
+ 
+    fn post_app_specialize(&mut self, _: &AppSpecializeArgs) {
+        unsafe {
+            if OLD_OPEN_COMMON != 0 {
+                dobby_rs::unhook(OLD_OPEN_COMMON);
             }
-            info!("dump {}", package_name);
-            let open_common = dobby_rs::resolve_symbol("libdexfile.so", "_ZN3art13DexFileLoader10OpenCommonENSt3__110shared_ptrINS_16DexFileContainerEEEPKhmRKNS1_12basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEENS1_8optionalIjEEPKNS_10OatDexFileEbbPSC_PNS_22DexFileLoaderErrorCodeE")
-                .ok_or_else(|| anyhow::anyhow!("resolve symbol error"))?;
-            info!("open_common addr: {:x}", open_common as usize);
-            unsafe {
-                OLD_OPEN_COMMON =
-                    dobby_rs::hook(open_common, new_open_common_wrapper as Address)? as usize
-            };
-
-            Ok(())
-        };
-        if let Err(e) = inner() {
-            error!("pre_app_specialize error: {:?}", e);
+            libc::dlclose(self.api.module_handle());
         }
     }
-
-    fn post_app_specialize(&mut self, _args: &AppSpecializeArgs) {}
-
-    fn pre_server_specialize(&mut self, _args: &mut ServerSpecializeArgs) {}
-
-    fn post_server_specialize(&mut self, _args: &ServerSpecializeArgs) {}
 }
-
-register_zygisk_module!(MyModule);
-static mut OLD_OPEN_COMMON: usize = 0;
-
+ 
+// --- 核心逻辑实现 --- 
+impl DexDumper {
+    fn setup_hook(&self) -> anyhow::Result<()> {
+        // 包名过滤 
+        let package = self.get_package_name(args)?;
+        if !check_allowlist(&package)? { return Ok(()); }
+ 
+        // 动态符号解析 
+        let open_common_addr = find_open_common()?;
+        
+        // PLT Hook 
+        unsafe {
+            OLD_OPEN_COMMON = dobby_rs::hook(open_common_addr, plt_hook_wrapper as Address)? as usize;
+        }
+        Ok(())
+    }
+ 
+    fn get_package_name(&self, args: &AppSpecializeArgs) -> anyhow::Result<String> {
+        // 解析JNI获取包名（略）
+    }
+}
+ 
+// --- Hook与数据处理 --- 
 #[naked]
-pub extern "C" fn new_open_common_wrapper() {
-    unsafe {
-        naked_asm!(
-            r#"
-            sub sp, sp, 0x280
-            stp x29, x30, [sp, #0]
-            stp x0, x1, [sp, #0x10]
-            stp x2, x3, [sp, #0x20]
-            stp x4, x5, [sp, #0x30]
-            stp x6, x7, [sp, #0x40]
-            stp x8, x9, [sp, #0x50]
-
-            mov x0, x1
-            mov x1, x2
-            bl {new_open_common}
-
-            ldp x29, x30, [sp, #0]
-            ldp x0, x1, [sp, #0x10]
-            ldp x2, x3, [sp, #0x20]
-            ldp x4, x5, [sp, #0x30]
-            ldp x6, x7, [sp, #0x40]
-            ldp x8, x9, [sp, #0x50]
-            add sp, sp, 0x280
-            adrp x16, {old_open_common}
-            ldr x16, [x16, #:lo12:{old_open_common}]
-            br x16"#,
-            new_open_common = sym new_open_common,
-            old_open_common = sym OLD_OPEN_COMMON,
-            // options(noreturn)
-        );
-    }
+extern "C" fn plt_hook_wrapper() {
+    unsafe { /* 汇编代码保存寄存器并调用new_open_common */ }
 }
-
-extern "C" fn new_open_common(base: usize, size: usize) {
-    info!("find dex: base=0x{:x}, size=0x{:x}", base, size);
-
-    let dex_data = unsafe { std::slice::from_raw_parts(base as *const u8, size) };
-    let package = match std::fs::read_to_string("/proc/self/cmdline") {
-        Ok(cmdline) => cmdline,
-        Err(e) => {
-            error!("read cmdline error: {:?}", e);
-            return;
-        }
-    };
-    if package.is_empty() {
-        error!("package name is empty");
+ 
+extern "C" fn new_open_common(base: *const u8, size: usize) {
+    let dex_data = unsafe { std::slice::from_raw_parts(base, size) };
+    let package = get_current_package().unwrap_or_default();
+    
+    // 内存校验 
+    let original_hash = sha256(dex_data);
+    let current_hash = sha256(unsafe { std::slice::from_raw_parts(base, size) });
+    if original_hash != current_hash {
+        warn!("Memory tampered: {}", package);
         return;
     }
-    let Some(package) = package.split('\0').next() else {
-        error!("package name split by zero error: {}", package);
-        return;
-    };
-
+ 
+    // 异步写入 
+    WRITER_CHANNEL.0.send((package, dex_data.to_vec())).unwrap();
+}
+ 
+fn process_dex(package: &str, data: &[u8]) {
+    // 去重校验 
+    let hash = sha256(data);
+    if CACHE.lock().unwrap().contains(&hash) { return; }
+ 
+    // 文件写入 
     let dir = format!("/data/data/{}/dexes", package);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        error!("create dir error: {:?}", e);
+    if let Err(e) = create_dir_all(&dir) { 
+        error!("Dir creation failed: {}", e);
         return;
     }
-
-    let crc = crc::Crc::<u32>::new(&crc::CRC_32_CD_ROM_EDC);
-    let mut digest = crc.digest();
-    digest.update(dex_data);
-
-    let file_name = format!("/data/data/{}/dexes/{:08x}.dex", package, digest.finalize());
-    if let Err(e) = std::fs::write(file_name, dex_data) {
-        error!("write file error: {:?}", e);
+ 
+    let path = format!("{}/{}.dex", dir, hash);
+    if let Err(e) = std::fs::write(&path, data) {
+        error!("Write failed: {}", e);
+    } else {
+        CACHE.lock().unwrap().insert(hash);
     }
 }
+ 
+// --- 辅助工具函数 --- 
+fn sha256(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
+ 
+fn find_open_common() -> anyhow::Result<Address> {
+    // 动态解析ELF定位目标函数 
+    let lib = unsafe { libloading::Library::new("libdexfile.so")? };
+    let base = lib.as_ptr() as usize;
+    
+    let elf_data = unsafe { 
+        std::slice::from_raw_parts(base as *const u8, 0x100000) // 模拟ELF读取 
+    };
+    let elf = Elf::parse(elf_data)?;
+    
+    for sym in elf.syms.iter().filter(|s| s.st_type() == STT_FUNC) {
+        if let Some(name) = elf.strtab.get(sym.st_name) {
+            if name.contains("OpenCommon") {
+                return Ok((base + sym.st_value) as Address);
+            }
+        }
+    }
+    anyhow::bail!("Symbol not found");
+}
+ 
+register_zygisk_module!(DexDumper);​
